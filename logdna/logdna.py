@@ -6,8 +6,6 @@ import sys
 import threading
 import time
 
-from concurrent.futures import ThreadPoolExecutor
-
 from .configs import defaults
 from .utils import sanitize_meta, get_ip, normalize_list_option
 
@@ -77,18 +75,11 @@ class LogDNAHandler(logging.Handler):
             "buf_retention_limit", defaults["BUF_RETENTION_LIMIT"]
         )
 
-        # Set up the Thread Pools
-        self.worker_thread_pool = ThreadPoolExecutor()
-        self.request_thread_pool = ThreadPoolExecutor(
-            max_workers=self.max_concurrent_requests
-        )
-
         # Set up async client and event loop
         self.async_client = None
         self.loop = None
 
         self.setLevel(logging.DEBUG)
-        self._lock = threading.RLock()
 
         self.flusher = None
 
@@ -123,77 +114,53 @@ class LogDNAHandler(logging.Handler):
             return loop
 
     def buffer_log(self, message):
-        if self.worker_thread_pool:
-            try:
-                self.worker_thread_pool.submit(self.buffer_log_sync, message)
-            except RuntimeError:
-                self.buffer_log_sync(message)
-            except Exception as e:
-                self.internalLogger.debug("Error in calling buffer_log: %s", e)
+        self.buffer_log_sync(message)
 
     def buffer_log_sync(self, message):
-        # Attempt to acquire lock to write to buffer
-        if self._lock.acquire(blocking=True):
-            try:
-                msglen = len(message["line"])
-                if self.buf_size + msglen < self.buf_retention_limit:
-                    self.buf.append(message)
-                    self.buf_size += msglen
-                else:
-                    self.internalLogger.debug(
-                        "The buffer size exceeded the limit: %s",
-                        self.buf_retention_limit,
-                    )
+        try:
+            msglen = len(message["line"])
+            if self.buf_size + msglen < self.buf_retention_limit:
+                self.buf.append(message)
+                self.buf_size += msglen
+            else:
+                self.internalLogger.debug(
+                    "The buffer size exceeded the limit: %s",
+                    self.buf_retention_limit,
+                )
 
-                if self.buf_size >= self.flush_limit:
-                    self.close_flusher()
-                    self.flush()
-                else:
-                    self.start_flusher()
-            except Exception as e:
-                self.internalLogger.exception(f"Error in buffer_log_sync: {e}")
-            finally:
-                self._lock.release()
+            if self.buf_size >= self.flush_limit:
+                self.close_flusher()
+                self.flush()
+            else:
+                self.start_flusher()
+        except Exception as e:
+            self.internalLogger.exception(f"Error in buffer_log_sync: {e}")
 
     def flush(self):
         self.schedule_flush_sync()
 
     def schedule_flush_sync(self, should_block=False):
-        if self.request_thread_pool:
-            try:
-                self.request_thread_pool.submit(
-                    self.try_lock_and_do_flush_request, should_block
-                )
-            except RuntimeError:
-                self.try_lock_and_do_flush_request(should_block)
-            except Exception as e:
-                self.internalLogger.debug(
-                    "Error in calling try_lock_and_do_flush_request: %s", e
-                )
+        self.try_lock_and_do_flush_request(should_block)
 
     def try_lock_and_do_flush_request(self, should_block=False):
         local_buf = []
-        if self._lock.acquire(blocking=should_block):
-            if not self.buf:
-                self.close_flusher()
-                self._lock.release()
-                return
+        # Simple buffer extraction - no locks needed
+        if not self.buf:
+            self.close_flusher()
+            return
 
-            local_buf = self.buf.copy()
-            self.buf.clear()
-            self.buf_size = 0
-            if local_buf:
-                self.close_flusher()
-            self._lock.release()
+        local_buf = self.buf.copy()
+        self.buf.clear()
+        self.buf_size = 0
+        if local_buf:
+            self.close_flusher()
 
         if local_buf:
             # Run the async request in the event loop
             loop = self._get_event_loop()
             if loop.is_running():
-                # If we're already in an event loop, create a task
                 asyncio.create_task(self.try_request(local_buf))
             else:
-                # If no event loop is running, run the coroutine
                 loop.run_until_complete(self.try_request(local_buf))
 
     async def try_request(self, buf):
@@ -356,28 +323,12 @@ class LogDNAHandler(logging.Handler):
         # Close the flusher
         self.close_flusher()
 
-        # First gracefully shut down any threads that are still attempting
-        # to add log messages to the buffer. This ensures that we don't lose
-        # any log messages that are in the process of being added to the
-        # buffer.
-        if self.worker_thread_pool:
-            self.worker_thread_pool.shutdown(wait=True)
-            self.worker_thread_pool = None
-
         # Manually force a flush of any remaining log messages in the buffer.
         # We block here to ensure that the flush completes prior to the
         # application exiting and because the probability of this
         # introducing a noticeable delay is very low because close() is only
         # called when the logger and application are shutting down.
-        self.schedule_flush_sync(should_block=True)
-
-        # Finally, shut down the thread pool that was used to send the log
-        # messages to the server. We can assume at this point that all log
-        # messages that were in the buffer prior to the worker threads
-        # shutting down have been sent to the server.
-        if self.request_thread_pool:
-            self.request_thread_pool.shutdown(wait=True)
-            self.request_thread_pool = None
+        self.flush()
 
         # Close the async httpx client
         if self.async_client:
